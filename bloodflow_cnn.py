@@ -1,129 +1,185 @@
+import os
+import random
+import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+import matplotlib.pyplot as plt
+from tqdm import tqdm
 
+# ==========================================================
+# Utilities
+# ==========================================================
 
-class SEBlock2D(nn.Module):
+def set_seed(seed=42):
+    """Set random seeds for reproducibility."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+def generate_synthetic_3d_data(num_samples=64, shape=(1, 16, 128, 128)):
+    """Generate synthetic 3D data for regression."""
+    x = torch.randn(num_samples, *shape)
+    y = torch.randn(num_samples, 1) * 5 + 2
+    return TensorDataset(x, y)
+
+# ==========================================================
+# 3D CNN Model
+# ==========================================================
+
+class BloodFlowCNN3D(nn.Module):
     """
-    2D Squeeze-and-Excitation block for adaptive channel weighting.
+    3D CNN for blood flow velocity regression.
+    Input: (B, C=1, D, H, W)
+    Output: (B, 1)
     """
-    def __init__(self, channels: int, reduction: int = 16):
+    def __init__(self, input_channels=1, output_channels=1, dropout=0.2):
         super().__init__()
-        reduced = max(channels // reduction, 1)
-        self.fc1 = nn.Linear(channels, reduced, bias=True)
-        self.fc2 = nn.Linear(reduced, channels, bias=True)
+        self.conv1 = nn.Conv3d(input_channels, 16, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm3d(16)
+        self.conv2 = nn.Conv3d(16, 32, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm3d(32)
+        self.conv3 = nn.Conv3d(32, 64, kernel_size=3, padding=1)
+        self.bn3 = nn.BatchNorm3d(64)
+        self.pool = nn.AdaptiveAvgPool3d(1)
+        self.dropout = nn.Dropout(dropout)
+        self.fc = nn.Linear(64, output_channels)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, C, H, W)
-        b, c, h, w = x.size()
-        squeeze = x.view(b, c, -1).mean(dim=2)  # Global avg over H,W
-        excitation = F.relu(self.fc1(squeeze), inplace=True)
-        excitation = torch.sigmoid(self.fc2(excitation))
-        excitation = excitation.view(b, c, 1, 1)
-        return x * excitation
-
-
-class BloodFlowCNN2D(nn.Module):
-    """
-    2D CNN for speckle pattern blood flow regression.
-    Input: (B, 1, H, W)
-    Output: (B, 1) continuous value
-    """
-    def __init__(
-        self,
-        input_channels: int = 1,
-        base_channels: int = 32,
-        reduction: int = 16,
-        dropout_rate: float = 0.4,
-        input_norm: bool = True,
-        output_channels: int = 1,
-    ):
-        super().__init__()
-
-        self.input_norm = nn.BatchNorm2d(input_channels) if input_norm else nn.Identity()
-
-        # 2D CNN encoder
-        self.encoder = nn.Sequential(
-            nn.Conv2d(input_channels, base_channels, kernel_size=3, padding=1),
-            nn.BatchNorm2d(base_channels),
-            nn.LeakyReLU(inplace=True),
-            nn.MaxPool2d(2),
-
-            nn.Conv2d(base_channels, base_channels * 2, kernel_size=3, padding=1),
-            nn.BatchNorm2d(base_channels * 2),
-            nn.LeakyReLU(inplace=True),
-            nn.MaxPool2d(2),
-
-            nn.Conv2d(base_channels * 2, base_channels * 4, kernel_size=3, padding=1),
-            nn.BatchNorm2d(base_channels * 4),
-            nn.LeakyReLU(inplace=True),
-
-            SEBlock2D(base_channels * 4, reduction=reduction),
-
-            nn.Conv2d(base_channels * 4, base_channels * 8, kernel_size=3, padding=1),
-            nn.BatchNorm2d(base_channels * 8),
-            nn.LeakyReLU(inplace=True),
-            nn.AdaptiveAvgPool2d((1, 1)),
-        )
-
-        # Regression head
-        self.dropout = nn.Dropout(dropout_rate)
-        self.fc1 = nn.Linear(base_channels * 8, base_channels * 4)
-        self.relu = nn.ReLU(inplace=True)
-        self.fc2 = nn.Linear(base_channels * 4, output_channels)  # single regression output
-
-        self._initialize_weights()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        self._validate_input_shape(x)
-        x = self.input_norm(x)
-        x = self.encoder(x)
-        x = torch.flatten(x, 1)
+    def forward(self, x):
+        x = F.relu(self.bn1(self.conv1(x)))
+        x = F.relu(self.bn2(self.conv2(x)))
+        x = F.relu(self.bn3(self.conv3(x)))
+        x = self.pool(x)
+        x = x.view(x.size(0), -1)
         x = self.dropout(x)
-        x = self.fc1(x)
-        x = self.relu(x)
-        x = self.fc2(x)  # regression output
-        return x
+        return self.fc(x)
 
-    def _initialize_weights(self):
-        """Kaiming-normal initialization for Conv and Linear layers."""
-        for m in self.modules():
-            if isinstance(m, (nn.Conv2d, nn.Linear)):
-                nn.init.kaiming_normal_(m.weight, nonlinearity='leaky_relu')
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-            elif isinstance(m, (nn.BatchNorm2d, nn.BatchNorm1d)):
-                nn.init.constant_(m.weight, 1)
-                nn.init.constant_(m.bias, 0)
+# ==========================================================
+# Evaluation & Plotting
+# ==========================================================
 
-    @staticmethod
-    def _validate_input_shape(x: torch.Tensor):
-        if x.ndim != 4:
-            raise ValueError(f"Expected input shape (B, C, H, W), got {x.shape}")
-        if x.size(1) != 1:
-            raise ValueError(f"Expected single channel input, got {x.size(1)} channels.")
+def evaluate_model(model, loader, criterion, device):
+    """Evaluate model and return metrics and predictions."""
+    model.eval()
+    preds, trues = [], []
+    total_loss = 0
+    with torch.no_grad():
+        for x, y in loader:
+            x, y = x.to(device), y.to(device)
+            y_pred = model(x)
+            loss = criterion(y_pred, y)
+            total_loss += loss.item() * x.size(0)
+            preds.append(y_pred.cpu())
+            trues.append(y.cpu())
+    preds = torch.cat(preds)
+    trues = torch.cat(trues)
+    mse = mean_squared_error(trues, preds)
+    mae = mean_absolute_error(trues, preds)
+    r2 = r2_score(trues, preds)
+    return total_loss / len(loader.dataset), mse, mae, r2, preds, trues
 
-    def freeze_encoder(self):
-        """Freeze encoder layers for transfer learning."""
-        for param in self.encoder.parameters():
-            param.requires_grad = False
+def plot_predictions(trues, preds, out_path, title="Predicted vs True"):
+    """Publication-ready scatter plot."""
+    plt.figure(figsize=(6,6))
+    plt.scatter(trues, preds, s=30, alpha=0.6)
+    lims = [min(trues.min(), preds.min()), max(trues.max(), preds.max())]
+    plt.plot(lims, lims, 'r--', label="Perfect Fit")
+    plt.xlabel("True Values")
+    plt.ylabel("Predicted Values")
+    plt.title(title)
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(out_path)
+    plt.close()
 
-    def unfreeze_encoder(self):
-        """Unfreeze encoder layers."""
-        for param in self.encoder.parameters():
-            param.requires_grad = True
+def plot_loss_curve(train_losses, val_losses, out_path):
+    """Plot training and validation loss curves."""
+    plt.figure(figsize=(7,5))
+    plt.plot(train_losses, label="Train Loss", linewidth=2)
+    plt.plot(val_losses, label="Validation Loss", linewidth=2)
+    plt.xlabel("Epoch")
+    plt.ylabel("MSE Loss")
+    plt.title("Training vs Validation Loss")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(out_path)
+    plt.close()
 
+# ==========================================================
+# Training Loop (3D CNN)
+# ==========================================================
 
-def get_model(**kwargs) -> BloodFlowCNN2D:
-    """Factory function to create 2D BloodFlowCNN regression model."""
-    return BloodFlowCNN2D(**kwargs)
+def train_3d_cnn(
+    input_shape=(1, 16, 128, 128),
+    epochs=50,
+    batch_size=8,
+    lr=1e-3,
+    save_dir="results_3d_cnn"
+):
+    set_seed(42)
+    os.makedirs(save_dir, exist_ok=True)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    # Data loaders
+    train_data = generate_synthetic_3d_data(80, shape=input_shape)
+    val_data = generate_synthetic_3d_data(20, shape=input_shape)
+    train_loader = DataLoader(train_data, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_data, batch_size=batch_size)
+
+    # Model, loss, optimizer
+    model = BloodFlowCNN3D(input_channels=input_shape[0]).to(device)
+    criterion = nn.MSELoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+    best_val_loss = float("inf")
+    history = {"train_loss": [], "val_loss": []}
+
+    for epoch in range(1, epochs+1):
+        model.train()
+        total_loss = 0
+        for x, y in tqdm(train_loader, desc=f"Epoch {epoch}/{epochs}"):
+            x, y = x.to(device), y.to(device)
+            optimizer.zero_grad()
+            y_pred = model(x)
+            loss = criterion(y_pred, y)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item() * x.size(0)
+
+        train_loss = total_loss / len(train_loader.dataset)
+        val_loss, mse, mae, r2, preds, trues = evaluate_model(model, val_loader, criterion, device)
+        history["train_loss"].append(train_loss)
+        history["val_loss"].append(val_loss)
+
+        # Save predictions CSV & plot every epoch
+        pd.DataFrame({"True": trues.squeeze().numpy(), "Predicted": preds.squeeze().numpy()})\
+            .to_csv(os.path.join(save_dir, f"epoch_{epoch:03d}_predictions.csv"), index=False)
+        plot_predictions(trues, preds, os.path.join(save_dir, f"epoch_{epoch:03d}_scatter.png"),
+                         title=f"Epoch {epoch}: Predicted vs True (R²={r2:.3f})")
+
+        print(f"Epoch {epoch:02d} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
+              f"MSE: {mse:.4f} | MAE: {mae:.4f} | R²: {r2:.4f}")
+
+        # Save best model
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            torch.save(model.state_dict(), os.path.join(save_dir, "best_model.pt"))
+
+    # Final loss curve
+    plot_loss_curve(history["train_loss"], history["val_loss"], os.path.join(save_dir, "loss_curve.png"))
+    print("\n✅ Training complete. Best model + plots saved in:", save_dir)
+
+# ==========================================================
+# Standalone Test
+# ==========================================================
 
 if __name__ == "__main__":
-    # Quick sanity check
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = get_model(output_channels=1).to(device)
-    dummy_input = torch.randn(2, 1, 128, 128).to(device)
-    with torch.no_grad():
-        output = model(dummy_input)
-    print("Output shape:", output.shape)  # (B,1)
+    train_3d_cnn()
